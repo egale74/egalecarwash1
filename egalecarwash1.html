@@ -359,7 +359,20 @@
             }
             const diffTime = Math.abs(expiry - now);
             const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-            return { status: "Active", isActive: true, daysRemaining: diffDays, planName: sub.planName, expiryDate: sub.expiryDate, startDate: sub.startDate };
+            const washesUsed = sub.washesUsed || 0;
+            const maxWashes = sub.maxWashes || 8;
+            return {
+                status: washesUsed >= maxWashes ? "Wash Limit Reached" : "Active",
+                isActive: true,
+                canWash: washesUsed < maxWashes,
+                daysRemaining: diffDays,
+                planName: sub.planName,
+                expiryDate: sub.expiryDate,
+                startDate: sub.startDate,
+                washesUsed,
+                maxWashes,
+                subscription: sub
+            };
         }
 
         function getCustomerGeneralSubscriptionSummary(customer) {
@@ -773,8 +786,6 @@
             if(!custId) { container.innerHTML = ""; return; }
             
             const customer = db.customers.find(c => c.id === parseInt(custId));
-            const washesUsed = getWashesUsedThisMonth(customer.phone);
-            
             let vehiclesHtml = customer.vehicles.map(v => {
                 const plate = getVehiclePlate(v);
                 const subInfo = getVehicleSubscriptionStatus(customer, plate);
@@ -788,6 +799,7 @@
                         </div>
                         <div style="font-size: 13px; margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
                             <div><b>Plan Name:</b> ${subInfo.isActive ? subInfo.planName : 'None'}</div>
+                            <div><b>Washes Used:</b> ${subInfo.isActive ? `${subInfo.washesUsed} / ${subInfo.maxWashes}` : 'N/A'}</div>
                             <div><b>Days Remaining:</b> ${subInfo.daysRemaining} days</div>
                             <div><b>Start Date:</b> ${subInfo.isActive ? new Date(subInfo.startDate).toLocaleDateString() : 'N/A'}</div>
                             <div><b>Expiry Date:</b> ${subInfo.isActive ? new Date(subInfo.expiryDate).toLocaleDateString() : 'N/A'}</div>
@@ -804,7 +816,7 @@
             container.innerHTML = `
                 <div style="border: 2px dashed var(--sub-color); padding:20px; border-radius:8px; margin-top:15px; background: #faf9ff;">
                     <h3 style="margin-top:0;">Customer Account Plan: ${customer.name}</h3>
-                    <p>Washes Used This Month: <strong>${washesUsed}</strong> | Unlimited Remaining: <strong>∞</strong></p>
+                    <p>Each active subscription lasts <strong>30 days</strong> and includes <strong>8 washes per vehicle</strong>.</p>
                     
                     <div style="margin: 15px 0;">
                         <h4>Per Car Active Registries</h4>
@@ -891,10 +903,12 @@
             targets.forEach(plate => {
                 customer.subscriptionsList.push({
                     plate: plate,
-                    planName: "Unlimited Wash Plan",
+                    planName: "30-Day / 8-Wash Plan",
                     active: true,
                     startDate: startDate.toISOString(),
                     expiryDate: expiryDate.toISOString(),
+                    maxWashes: 8,
+                    washesUsed: 0,
                     cancelled: false
                 });
             });
@@ -913,7 +927,7 @@
                 phone: customer.phone,
                 name: customer.name,
                 vehicle: `Plates upgraded: ${targets.join(', ')}`,
-                detail: `Subscription Upgrade - Unlimited Wash Plan (${targets.length} car/s)`,
+                detail: `Subscription Upgrade - 30-Day / 8-Wash Plan (${targets.length} car/s)`,
                 amount: totalChargedAmount,
                 baseAmount: parseFloat(preVat.toFixed(2)),
                 preVat: parseFloat(preVat.toFixed(2)),
@@ -1580,9 +1594,11 @@
                     priceInput.value = 0;
                     priceInput.disabled = true; // Lock price at 0 SEK
                     if (submitBtn) {
-                        submitBtn.disabled = true;
-                        submitBtn.innerText = "🔒 Security Blocked: Active Subscription (No payment allowed)";
-                        submitBtn.style.background = "var(--danger)";
+                        submitBtn.disabled = !subInfo.canWash;
+                        submitBtn.innerText = subInfo.canWash
+                            ? `Use Subscription Wash (${subInfo.washesUsed}/${subInfo.maxWashes})`
+                            : "🔒 8-Wash Limit Reached";
+                        submitBtn.style.background = subInfo.canWash ? "var(--success)" : "var(--danger)";
                     }
                 } else {
                     subNotice.style.display = 'none';
@@ -1628,10 +1644,9 @@
             if(!cust) return alert("Select a valid customer.");
             if(!plate || plate === "ADD_NEW_VEHICLE") return alert("Select a vehicle.");
 
-            // Strict fallback intercept validation
             const subInfo = getVehicleSubscriptionStatus(cust, plate);
-            if(subInfo.isActive) {
-                return alert("Security Refusal: This vehicle has an active Unlimited Wash Plan subscription. No new booking payment can be processed until it is deactivated or expired!");
+            if(subInfo.isActive && !subInfo.canWash) {
+                return alert("This subscription has reached its limit of 8 washes. It remains valid until the 30-day expiry date, but another wash cannot be recorded.");
             }
 
             if (!confirm("Are you sure you want to process and finalize this order?")) return;
@@ -1642,11 +1657,17 @@
             
             if(isNaN(priceValue) || priceValue < 0) return alert("Enter a valid price.");
             
-            const serviceName = serviceInput || 'Custom Service';
-            const preVat = priceValue;
+            const isSubscriptionWash = subInfo.isActive && subInfo.canWash;
+            const serviceName = isSubscriptionWash ? 'Subscription Wash' : (serviceInput || 'Custom Service');
+            const finalPrice = isSubscriptionWash ? 0 : priceValue;
+            const preVat = finalPrice;
             const vatAmount = parseFloat((preVat * 0.25).toFixed(2));
             const orderAmount = parseFloat((preVat + vatAmount).toFixed(2));
-            if(method === 'credit') cust.balance = (cust.balance || 0) + orderAmount;
+            if(isSubscriptionWash) {
+                subInfo.subscription.washesUsed = subInfo.washesUsed + 1;
+            } else if(method === 'credit') {
+                cust.balance = (cust.balance || 0) + orderAmount;
+            }
             const orderId = Date.now();
             db.orders.unshift({ 
                 id: orderId,
@@ -1658,7 +1679,10 @@
                 baseAmount: priceValue,
                 preVat,
                 vatAmount,
-                method, date: new Date().toISOString(),
+                method: isSubscriptionWash ? 'subscription' : method,
+                date: new Date().toISOString(),
+                isSubscriptionWash,
+                subscriptionId: isSubscriptionWash ? subInfo.subscription.startDate : null,
                 staff: currentUser.name 
             });
             save(); showInvoice(orderId);
